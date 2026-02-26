@@ -57,7 +57,7 @@
 //! 3. If `shutdown_timeout` is configured, abandons remaining operations after the timeout
 //! 4. Cleans up and exits
 
-use crate::{IoBuf, IoBufMut};
+use crate::{IoBuf, IoBufMut, IoBufs};
 use commonware_utils::channel::{
     mpsc::{self, error::TryRecvError},
     oneshot,
@@ -79,13 +79,16 @@ const TIMEOUT_WORK_ID: u64 = u64::MAX;
 ///
 /// The variant must match the operation type:
 /// - `Read`: For operations where the kernel writes INTO the buffer (e.g., recv, read)
-/// - `Write`: For operations where the kernel reads FROM the buffer (e.g., send, write)
+/// - `Write`: For operations where the kernel reads FROM a single contiguous buffer (e.g., send)
+/// - `WriteVectored`: For operations where the kernel reads FROM multiple buffers (e.g., writev)
 #[derive(Debug)]
 pub enum OpBuffer {
     /// Buffer for read operations - kernel writes into this.
     Read(IoBufMut),
     /// Buffer for write operations - kernel reads from this.
     Write(IoBuf),
+    /// Buffers for vectored write operations - kernel reads from these.
+    WriteVectored(IoBufs),
 }
 
 impl From<IoBufMut> for OpBuffer {
@@ -97,6 +100,12 @@ impl From<IoBufMut> for OpBuffer {
 impl From<IoBuf> for OpBuffer {
     fn from(buf: IoBuf) -> Self {
         Self::Write(buf)
+    }
+}
+
+impl From<IoBufs> for OpBuffer {
+    fn from(bufs: IoBufs) -> Self {
+        Self::WriteVectored(bufs)
     }
 }
 
@@ -113,6 +122,31 @@ pub enum OpFd {
     File(Arc<File>),
 }
 
+/// Owned iovecs that back a vectored io_uring operation.
+///
+/// This wrapper allows transferring iovec arrays through channels while keeping
+/// the pointed-to buffer memory alive through [`OpBuffer`].
+pub struct OpIovecs(#[allow(dead_code)] Vec<libc::iovec>);
+
+impl OpIovecs {
+    pub const fn new(iovecs: Vec<libc::iovec>) -> Self {
+        Self(iovecs)
+    }
+
+    pub const fn as_ptr(&self) -> *const libc::iovec {
+        self.0.as_ptr()
+    }
+
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+// SAFETY: `OpIovecs` only carries raw iovec descriptors. The pointed-to memory
+// is owned by `OpBuffer` and retained for the operation lifetime by the
+// io_uring waiter map.
+unsafe impl Send for OpIovecs {}
+
 /// Active operations keyed by their work id.
 ///
 /// Each entry keeps the caller's oneshot sender, the buffer that must stay
@@ -124,6 +158,7 @@ type Waiters = HashMap<
         oneshot::Sender<(i32, Option<OpBuffer>)>,
         Option<OpBuffer>,
         Option<OpFd>,
+        Option<OpIovecs>,
         Option<Box<Timespec>>,
     ),
 >;
@@ -249,9 +284,10 @@ pub struct Op {
     /// The buffer used for the operation, if any.
     /// - For reads: `OpBuffer::Read(IoBufMut)` - kernel writes into this
     /// - For writes: `OpBuffer::Write(IoBuf)` - kernel reads from this
+    /// - For vectored writes: `OpBuffer::WriteVectored(IoBufs)` - kernel reads from these
     /// - None for operations that don't use a buffer (e.g. sync, timeout)
     ///
-    /// We hold the buffer here so it's guaranteed to live until the operation
+    /// We hold the buffer(s) here so it's guaranteed to live until the operation
     /// completes, preventing use-after-free issues.
     pub buffer: Option<OpBuffer>,
     /// The file descriptor used for the operation, if any.
@@ -259,6 +295,11 @@ pub struct Op {
     /// We hold the descriptor here so the OS cannot reuse the FD number
     /// while the operation is queued or in-flight.
     pub fd: Option<OpFd>,
+    /// Owned iovecs used by vectored operations, if any.
+    ///
+    /// We hold these iovecs here so they're guaranteed to live until the operation
+    /// completes, preventing use-after-free issues.
+    pub iovecs: Option<OpIovecs>,
 }
 
 // Returns false iff we received a shutdown timeout
@@ -281,7 +322,8 @@ fn handle_cqe(waiters: &mut Waiters, cqe: CqueueEntry, cfg: &Config) {
                 result
             };
 
-            let (result_sender, buffer, _, _) = waiters.remove(&work_id).expect("missing sender");
+            let (result_sender, buffer, _, _, _) =
+                waiters.remove(&work_id).expect("missing sender");
             let _ = result_sender.send((result, buffer));
         }
     }
@@ -343,6 +385,7 @@ pub(crate) async fn run(cfg: Config, metrics: Arc<Metrics>, mut receiver: mpsc::
                 sender,
                 buffer,
                 fd,
+                iovecs,
             } = op;
 
             // Assign a unique id
@@ -375,8 +418,8 @@ pub(crate) async fn run(cfg: Config, metrics: Arc<Metrics>, mut receiver: mpsc::
 
                 // Submit the op and timeout.
                 //
-                // SAFETY: `buffer`, `timespec`, and `fd` are stored in
-                // `waiters` until the CQE is processed, ensuring memory
+                // SAFETY: `buffer`, `fd`, `iovecs`, and `timespec` are stored
+                // in `waiters` until the CQE is processed, ensuring memory
                 // referenced by the SQEs remains valid and the FD cannot be
                 // reused. The ring was doubled in size for timeout support, and
                 // `waiters.len() < cfg.size` guarantees space for both entries.
@@ -390,11 +433,11 @@ pub(crate) async fn run(cfg: Config, metrics: Arc<Metrics>, mut receiver: mpsc::
             } else {
                 // No timeout, submit the operation normally.
                 //
-                // SAFETY: `buffer` and `fd` are stored in `waiters` until
-                // the CQE is processed, ensuring memory referenced by the SQE
-                // remains valid and the FD cannot be reused. The loop condition
-                // `waiters.len() < cfg.size` guarantees space in the submission
-                // queue.
+                // SAFETY: `buffer`, `fd`, and `iovecs` are stored in `waiters`
+                // until the CQE is processed, ensuring memory referenced by the
+                // SQE remains valid and the FD cannot be reused. The loop
+                // condition `waiters.len() < cfg.size` guarantees space in the
+                // submission queue.
                 unsafe {
                     ring.submission()
                         .push(&work)
@@ -406,7 +449,7 @@ pub(crate) async fn run(cfg: Config, metrics: Arc<Metrics>, mut receiver: mpsc::
 
             // We'll send the result of this operation to `sender`.
             // `fd` is retained to prevent FD reuse until completion.
-            waiters.insert(work_id, (sender, buffer, fd, timespec));
+            waiters.insert(work_id, (sender, buffer, fd, iovecs, timespec));
         }
 
         // Submit and wait for at least 1 item to be in the completion queue.
@@ -527,6 +570,7 @@ mod tests {
                 sender: recv_tx,
                 buffer: Some(buf.into()),
                 fd: None,
+                iovecs: None,
             })
             .await
             .expect("failed to send work");
@@ -546,6 +590,7 @@ mod tests {
                 sender: write_tx,
                 buffer: Some(msg.into()),
                 fd: None,
+                iovecs: None,
             })
             .await
             .expect("failed to send work");
@@ -620,6 +665,7 @@ mod tests {
                 sender: tx,
                 buffer: Some(buf.into()),
                 fd: None,
+                iovecs: None,
             })
             .await
             .expect("failed to send work");
@@ -651,6 +697,7 @@ mod tests {
                 sender: tx,
                 buffer: None,
                 fd: None,
+                iovecs: None,
             })
             .await
             .unwrap();
@@ -685,6 +732,7 @@ mod tests {
                 sender: tx,
                 buffer: None,
                 fd: None,
+                iovecs: None,
             })
             .await
             .unwrap();
@@ -729,6 +777,7 @@ mod tests {
                     sender: tx,
                     buffer: None,
                     fd: None,
+                    iovecs: None,
                 })
                 .await
                 .unwrap();
@@ -768,6 +817,7 @@ mod tests {
                 sender: tx,
                 buffer: None,
                 fd: None,
+                iovecs: None,
             })
             .await
             .unwrap();

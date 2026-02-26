@@ -330,6 +330,7 @@ impl crate::Sink for Sink {
                     sender: tx,
                     buffer: Some(OpBuffer::Write(buf)),
                     fd: Some(OpFd::Fd(self.fd.clone())),
+                    iovecs: None,
                 })
                 .await
                 .map_err(|_| crate::Error::SendFailed)?;
@@ -424,6 +425,7 @@ impl Stream {
                     sender: tx,
                     buffer: Some(OpBuffer::Read(buffer)),
                     fd: Some(OpFd::Fd(self.fd.clone())),
+                    iovecs: None,
                 })
                 .await
                 .is_err()

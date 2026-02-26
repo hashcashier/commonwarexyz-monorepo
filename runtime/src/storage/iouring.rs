@@ -22,8 +22,8 @@
 
 use super::Header;
 use crate::{
-    iouring::{self, should_retry, OpBuffer, OpFd},
-    BufferPool, Error, IoBufs, IoBufsMut,
+    iouring::{self, should_retry, OpBuffer, OpFd, OpIovecs},
+    Buf, BufferPool, Error, IoBuf, IoBufs, IoBufsMut,
 };
 use commonware_codec::Encode;
 use commonware_utils::{
@@ -41,6 +41,10 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+// Cap iovec batch size: larger iovecs reduce syscall count but increase
+// per-write kernel setup overhead.
+const IOVEC_BATCH_SIZE: usize = 32;
 
 /// Syncs a directory to ensure directory entry changes are durable.
 /// On Unix, directory metadata (file creation/deletion) must be explicitly fsynced.
@@ -267,6 +271,138 @@ impl Blob {
             pool,
         }
     }
+
+    async fn write_single_at(
+        &self,
+        fd: types::Fd,
+        mut offset: u64,
+        mut buf: IoBuf,
+    ) -> Result<(), Error> {
+        let mut bytes_written = 0;
+        let buf_len = buf.len();
+        while bytes_written < buf_len {
+            // Figure out how much is left to write and where to write from.
+            //
+            // SAFETY: IoBuf wraps Bytes which has stable memory addresses.
+            // `bytes_written` is always < `buf_len` due to the loop condition, so
+            // `add(bytes_written)` stays within bounds and `buf_len - bytes_written`
+            // correctly represents the remaining valid bytes.
+            let ptr = unsafe { buf.as_ptr().add(bytes_written) };
+            let remaining_len = buf_len - bytes_written;
+            offset += bytes_written as u64;
+
+            // Create an operation to do the write
+            let op = opcode::Write::new(fd, ptr, remaining_len as _)
+                .offset(offset as _)
+                .build();
+
+            // Submit the operation
+            let (sender, receiver) = oneshot::channel();
+            self.io_sender
+                .send(iouring::Op {
+                    work: op,
+                    sender,
+                    buffer: Some(OpBuffer::Write(buf)),
+                    fd: Some(OpFd::File(self.file.clone())),
+                    iovecs: None,
+                })
+                .await
+                .map_err(|_| Error::WriteFailed)?;
+
+            // Wait for the result
+            let (return_value, got_buf) = receiver.await.map_err(|_| Error::WriteFailed)?;
+            buf = match got_buf {
+                Some(OpBuffer::Write(b)) => b,
+                _ => return Err(Error::WriteFailed),
+            };
+            if should_retry(return_value) {
+                continue;
+            }
+
+            // A negative or zero return value indicates an error.
+            let op_bytes_written: usize =
+                return_value.try_into().map_err(|_| Error::WriteFailed)?;
+            if op_bytes_written == 0 {
+                return Err(Error::WriteFailed);
+            }
+
+            bytes_written += op_bytes_written;
+        }
+
+        Ok(())
+    }
+
+    async fn write_vectored_at(
+        &self,
+        fd: types::Fd,
+        mut offset: u64,
+        mut bufs: IoBufs,
+    ) -> Result<(), Error> {
+        while bufs.has_remaining() {
+            // Figure out how much is left to write and where to write from.
+            let mut slices = [std::io::IoSlice::new(&[]); IOVEC_BATCH_SIZE];
+            let iov_count = bufs.chunks_vectored(&mut slices);
+            if iov_count == 0 {
+                return Err(Error::WriteFailed);
+            }
+
+            let iovecs = {
+                // We must materialize owned `libc::iovec` entries because io_uring may
+                // access the iovec array after submission returns.
+                let mut iovecs = Vec::with_capacity(iov_count);
+                for slice in &slices[..iov_count] {
+                    iovecs.push(libc::iovec {
+                        // SAFETY: `iov_base` is used as a read-only pointer by Writev.
+                        // `slice` points to valid readable bytes while `bufs` is retained
+                        // in `OpBuffer::WriteVectored` until completion.
+                        iov_base: slice.as_ptr() as *mut libc::c_void,
+                        iov_len: slice.len(),
+                    });
+                }
+                OpIovecs::new(iovecs)
+            };
+
+            // Create an operation to do the write
+            let op = opcode::Writev::new(fd, iovecs.as_ptr(), iovecs.len() as _)
+                .offset(offset as _)
+                .build();
+
+            // Submit the operation
+            let (sender, receiver) = oneshot::channel();
+            self.io_sender
+                .send(iouring::Op {
+                    work: op,
+                    sender,
+                    buffer: Some(OpBuffer::WriteVectored(bufs)),
+                    fd: Some(OpFd::File(self.file.clone())),
+                    iovecs: Some(iovecs),
+                })
+                .await
+                .map_err(|_| Error::WriteFailed)?;
+
+            // Wait for the result
+            let (return_value, got_bufs) = receiver.await.map_err(|_| Error::WriteFailed)?;
+            bufs = match got_bufs {
+                Some(OpBuffer::WriteVectored(b)) => b,
+                _ => return Err(Error::WriteFailed),
+            };
+            if should_retry(return_value) {
+                continue;
+            }
+
+            // A negative or zero return value indicates an error.
+            let op_bytes_written: usize =
+                return_value.try_into().map_err(|_| Error::WriteFailed)?;
+            if op_bytes_written == 0 {
+                return Err(Error::WriteFailed);
+            }
+
+            bufs.advance(op_bytes_written);
+            offset += op_bytes_written as u64;
+        }
+
+        Ok(())
+    }
 }
 
 impl crate::Blob for Blob {
@@ -296,7 +432,6 @@ impl crate::Blob for Blob {
 
         let fd = types::Fd(self.file.as_raw_fd());
         let mut bytes_read = 0;
-        let io_sender = self.io_sender.clone();
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
@@ -318,12 +453,13 @@ impl crate::Blob for Blob {
 
             // Submit the operation
             let (sender, receiver) = oneshot::channel();
-            io_sender
+            self.io_sender
                 .send(iouring::Op {
                     work: op,
                     sender,
                     buffer: Some(OpBuffer::Read(io_buf)),
                     fd: Some(OpFd::File(self.file.clone())),
+                    iovecs: None,
                 })
                 .await
                 .map_err(|_| Error::ReadFailed)?;
@@ -360,61 +496,16 @@ impl crate::Blob for Blob {
     }
 
     async fn write_at(&self, offset: u64, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
-        // Convert to contiguous IoBuf for io_uring write
-        // (zero-copy if single buffer, copies if multiple)
-        let mut buf = bufs.into().coalesce_with_pool(&self.pool);
+        let bufs = bufs.into();
         let fd = types::Fd(self.file.as_raw_fd());
-        let mut bytes_written = 0;
-        let buf_len = buf.len();
-        let io_sender = self.io_sender.clone();
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
-        while bytes_written < buf_len {
-            // Figure out how much is left to write and where to write from.
-            //
-            // SAFETY: IoBuf wraps Bytes which has stable memory addresses.
-            // `bytes_written` is always < `buf_len` due to the loop condition, so
-            // `add(bytes_written)` stays within bounds and `buf_len - bytes_written`
-            // correctly represents the remaining valid bytes.
-            let ptr = unsafe { buf.as_ptr().add(bytes_written) };
-            let remaining_len = buf_len - bytes_written;
-            let offset = offset + bytes_written as u64;
 
-            // Create an operation to do the write
-            let op = opcode::Write::new(fd, ptr, remaining_len as _)
-                .offset(offset as _)
-                .build();
-
-            // Submit the operation
-            let (sender, receiver) = oneshot::channel();
-            io_sender
-                .send(iouring::Op {
-                    work: op,
-                    sender,
-                    buffer: Some(OpBuffer::Write(buf)),
-                    fd: Some(OpFd::File(self.file.clone())),
-                })
-                .await
-                .map_err(|_| Error::WriteFailed)?;
-
-            // Wait for the result
-            let (return_value, got_buf) = receiver.await.map_err(|_| Error::WriteFailed)?;
-            buf = match got_buf {
-                Some(OpBuffer::Write(b)) => b,
-                _ => return Err(Error::WriteFailed),
-            };
-            if should_retry(return_value) {
-                continue;
-            }
-
-            // A negative return value indicates an error.
-            let op_bytes_written: usize =
-                return_value.try_into().map_err(|_| Error::WriteFailed)?;
-
-            bytes_written += op_bytes_written;
+        match bufs.try_into_single() {
+            Ok(buf) => self.write_single_at(fd, offset, buf).await,
+            Err(bufs) => self.write_vectored_at(fd, offset, bufs).await,
         }
-        Ok(())
     }
 
     // TODO: Make this async. See https://github.com/commonwarexyz/monorepo/issues/831
@@ -435,12 +526,12 @@ impl crate::Blob for Blob {
             // Submit the operation
             let (sender, receiver) = oneshot::channel();
             self.io_sender
-                .clone()
                 .send(iouring::Op {
                     work: op,
                     sender,
                     buffer: None,
                     fd: Some(OpFd::File(self.file.clone())),
+                    iovecs: None,
                 })
                 .await
                 .map_err(|_| {
