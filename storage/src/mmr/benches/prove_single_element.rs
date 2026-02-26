@@ -31,7 +31,7 @@ fn bench_prove_single_element(c: &mut Criterion) {
             };
             mmr.apply(changeset);
         });
-        let root = *mmr.root();
+        let root = mmr.root();
 
         // Select SAMPLE_SIZE random elements without replacement and create/verify proofs
         c.bench_function(

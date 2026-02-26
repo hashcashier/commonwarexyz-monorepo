@@ -35,7 +35,7 @@ fn bench_prove_many_elements(c: &mut Criterion) {
             };
             mmr.apply(changeset);
         });
-        let root = *mmr.root();
+        let root = mmr.root();
 
         // Generate SAMPLE_SIZE random starts without replacement and create/verify range proofs
         for range in [2, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000] {

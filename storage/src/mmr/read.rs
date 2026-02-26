@@ -23,7 +23,7 @@ pub trait MmrRead<D: Digest>: Send + Sync {
     fn get_node(&self, pos: Position) -> Option<D>;
 
     /// Root digest of the MMR.
-    fn root(&self) -> &D;
+    fn root(&self) -> D;
 
     /// Pruning boundary (highest pruned position, or 0).
     fn pruned_to_pos(&self) -> Position;

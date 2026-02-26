@@ -820,7 +820,10 @@ pub mod test {
             let v1 = Sha256::fill(0xA1);
             let k2 = Sha256::fill(0x02);
             let v2 = Sha256::fill(0xA2);
-            db_old.write_batch([(k1, Some(v1)), (k2, Some(v2))]).await.unwrap();
+            db_old
+                .write_batch([(k1, Some(v1)), (k2, Some(v2))])
+                .await
+                .unwrap();
             let (db_old, range_old) = db_old.commit(None).await.unwrap();
             let db_old = db_old.into_merkleized().await.unwrap();
             let root_old = db_old.root();
@@ -829,7 +832,10 @@ pub mod test {
             let partition_new = "batch-new".to_string();
             let db_new = open_db(context.with_label("new"), partition_new).await;
             let mut batch = db_new.new_batch();
-            batch.write_batch([(k1, Some(v1)), (k2, Some(v2))]).await.unwrap();
+            batch
+                .write_batch([(k1, Some(v1)), (k2, Some(v2))])
+                .await
+                .unwrap();
             let committed = batch.commit(None).await.unwrap();
             let changeset = committed.merkleize().await.unwrap();
             let range_new = changeset.committed_range().clone();
@@ -837,7 +843,10 @@ pub mod test {
             let db_new = changeset.apply();
 
             // Roots must match.
-            assert_eq!(root_old, root_new, "batch API root should match type-state root");
+            assert_eq!(
+                root_old, root_new,
+                "batch API root should match type-state root"
+            );
             assert_eq!(range_old, range_new, "committed ranges should match");
 
             // Proofs should work after apply.
@@ -879,7 +888,10 @@ pub mod test {
             let v2 = Sha256::fill(0xA2);
 
             let mut batch = db.new_batch();
-            batch.write_batch([(k1, Some(v1)), (k2, Some(v2))]).await.unwrap();
+            batch
+                .write_batch([(k1, Some(v1)), (k2, Some(v2))])
+                .await
+                .unwrap();
             let committed = batch.commit(None).await.unwrap();
             let changeset = committed.merkleize().await.unwrap();
             let root1 = changeset.root();
@@ -892,7 +904,10 @@ pub mod test {
             // Second batch: update one key, delete another.
             let v1_updated = Sha256::fill(0xB1);
             let mut batch = db.new_batch();
-            batch.write_batch([(k1, Some(v1_updated)), (k2, None)]).await.unwrap();
+            batch
+                .write_batch([(k1, Some(v1_updated)), (k2, None)])
+                .await
+                .unwrap();
             let committed = batch.commit(None).await.unwrap();
             let changeset = committed.merkleize().await.unwrap();
             let root2 = changeset.root();
@@ -960,9 +975,10 @@ pub mod test {
             // Build with old type-state API.
             let partition_old = "batch-random-old".to_string();
             let db_old = open_db(context.with_label("old"), partition_old).await;
-            let db_old = apply_random_ops::<CleanCurrentTest>(200, true, seed, db_old.into_mutable())
-                .await
-                .unwrap();
+            let db_old =
+                apply_random_ops::<CleanCurrentTest>(200, true, seed, db_old.into_mutable())
+                    .await
+                    .unwrap();
             let (db_old, _) = db_old.commit(None).await.unwrap();
             let db_old = db_old.into_merkleized().await.unwrap();
             let root_old = db_old.root();
@@ -978,7 +994,10 @@ pub mod test {
             let db_new = db_new.into_merkleized().await.unwrap();
             let root_new = db_new.root();
 
-            assert_eq!(root_old, root_new, "identical random ops should produce the same root");
+            assert_eq!(
+                root_old, root_new,
+                "identical random ops should produce the same root"
+            );
 
             db_old.destroy().await.unwrap();
             db_new.destroy().await.unwrap();

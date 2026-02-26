@@ -11,6 +11,7 @@ use crate::{
         Error as JournalError,
     },
     mmr::{
+        diff::{self, UnmerkleizedBatch},
         journaled::{CleanMmr, DirtyMmr, Mmr, State},
         mem::{Clean, Dirty},
         Error as MmrError, Location, Position, Proof, StandardHasher,
@@ -279,6 +280,22 @@ where
             hasher: self.hasher,
         }
     }
+
+    /// Create a speculative batch that reads through to this journal's MMR.
+    /// Multiple batches can coexist (shared borrow).
+    pub fn new_batch(&self) -> UnmerkleizedBatch<'_, H::Digest, CleanMmr<E, H::Digest>> {
+        self.mmr.new_batch()
+    }
+
+    /// Fork the hasher for use with speculative batches.
+    pub fn fork_hasher(&self) -> StandardHasher<H> {
+        StandardHasher::new()
+    }
+
+    /// Return the thread pool for parallel merkleization.
+    pub fn pool(&self) -> Option<commonware_parallel::ThreadPool> {
+        self.mmr.pool()
+    }
 }
 
 impl<E, C, H> Journal<E, C, H, Clean<H::Digest>>
@@ -304,6 +321,27 @@ where
             self.mmr.sync().map_err(Error::Mmr)
         )?;
 
+        Ok(())
+    }
+}
+
+impl<E, C, H> Journal<E, C, H, Clean<H::Digest>>
+where
+    E: Storage + Clock + Metrics,
+    C: Mutable<Item: EncodeShared>,
+    H: Hasher,
+{
+    /// Apply a pre-computed changeset and append corresponding items.
+    pub async fn apply_changeset(
+        &mut self,
+        changeset: diff::Changeset<H::Digest>,
+        items: Vec<C::Item>,
+    ) -> Result<(), Error> {
+        for item in items {
+            self.journal.append(item).await?;
+        }
+        self.mmr.apply(changeset);
+        debug_assert_eq!(*self.mmr.leaves(), self.journal.size().await);
         Ok(())
     }
 }
@@ -555,6 +593,7 @@ mod tests {
         journal::contiguous::fixed::{Config as JConfig, Journal as ContiguousJournal},
         mmr::{
             journaled::{Config as MmrConfig, Mmr},
+            read::MmrRead,
             Location,
         },
         qmdb::{
@@ -1685,6 +1724,50 @@ mod tests {
 
             // Should have replayed positions 25-49 (25 operations)
             assert_eq!(count, 25);
+        });
+    }
+
+    /// Verify the speculative batch API: fork two batches, verify independent roots, apply one.
+    #[test_traced("INFO")]
+    fn test_speculative_batch() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut journal = create_journal_with_ops(context, "speculative_batch", 10).await;
+            let original_root = journal.root();
+
+            // Fork two independent speculative batches.
+            let mut hasher1 = journal.fork_hasher();
+            let mut hasher2 = journal.fork_hasher();
+            let mut b1 = journal.new_batch();
+            let mut b2 = journal.new_batch();
+
+            // Add different items to each batch.
+            let op_a = create_operation(100);
+            let op_b = create_operation(200);
+            b1.add(&mut hasher1, &op_a.encode());
+            b2.add(&mut hasher2, &op_b.encode());
+
+            // Merkleize and verify independent roots.
+            let m1 = b1.merkleize(&mut hasher1);
+            let m2 = b2.merkleize(&mut hasher2);
+            assert_ne!(m1.root(), m2.root());
+            assert_ne!(m1.root(), original_root);
+            assert_ne!(m2.root(), original_root);
+
+            // Journal root should be unchanged (batches are speculative).
+            assert_eq!(journal.root(), original_root);
+
+            // Apply batch 1.
+            let expected_root = m1.root();
+            let changeset = m1.into_changeset();
+            journal
+                .apply_changeset(changeset, vec![op_a])
+                .await
+                .unwrap();
+
+            // Journal should now match the applied batch's root.
+            assert_eq!(journal.root(), expected_root);
+            assert_eq!(*journal.size().await, 11);
         });
     }
 }

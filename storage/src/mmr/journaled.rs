@@ -14,7 +14,7 @@ use crate::{
     },
     metadata::{Config as MConfig, Metadata},
     mmr::{
-        diff,
+        diff::{self, UnmerkleizedBatch},
         hasher::Hasher,
         iterator::{nodes_to_pin, PeakIterator},
         location::Location,
@@ -23,6 +23,7 @@ use crate::{
             Mmr as MemMmr, State as MemState,
         },
         position::Position,
+        read::{ChainInfo, MmrRead},
         storage::Storage,
         verification,
         Error::{self, *},
@@ -642,7 +643,7 @@ impl<E: RStorage + Clock + Metrics, D: Digest> CleanMmr<E, D> {
 
     /// Return the root of the MMR.
     pub fn root(&self) -> D {
-        *self.inner.read().mem_mmr.root()
+        self.inner.read().mem_mmr.root()
     }
 
     /// Return an inclusion proof for the element at the location `loc` against a historical MMR
@@ -798,15 +799,12 @@ impl<E: RStorage + Clock + Metrics, D: Digest> CleanMmr<E, D> {
     }
 
     /// Create a new batch for adding elements via the diff/batch API.
-    pub const fn new_batch(&self) -> Batch<'_, E, D> {
-        Batch {
-            mmr: self,
-            leaves: Vec::new(),
-        }
+    pub fn new_batch(&self) -> UnmerkleizedBatch<'_, D, Self> {
+        UnmerkleizedBatch::new(self).with_pool(self.pool())
     }
 
     /// Return a read guard to the inner memory-resident MMR.
-    pub fn inner_mmr(&self) -> MappedRwLockReadGuard<'_, CleanMemMmr<D>> {
+    pub(crate) fn inner_mmr(&self) -> MappedRwLockReadGuard<'_, CleanMemMmr<D>> {
         RwLockReadGuard::map(self.inner.read(), |inner| &inner.mem_mmr)
     }
 
@@ -814,6 +812,36 @@ impl<E: RStorage + Clock + Metrics, D: Digest> CleanMmr<E, D> {
     pub fn pool(&self) -> Option<ThreadPool> {
         self.pool.clone()
     }
+}
+
+impl<E: RStorage + Clock + Metrics, D: Digest> MmrRead<D> for CleanMmr<E, D> {
+    fn size(&self) -> Position {
+        self.size()
+    }
+
+    fn get_node(&self, pos: Position) -> Option<D> {
+        self.inner.read().mem_mmr.get_node(pos)
+    }
+
+    fn root(&self) -> D {
+        self.inner.read().mem_mmr.root()
+    }
+
+    fn pruned_to_pos(&self) -> Position {
+        self.inner.read().pruned_to_pos
+    }
+}
+
+impl<E: RStorage + Clock + Metrics, D: Digest> ChainInfo<D> for CleanMmr<E, D> {
+    fn base_size(&self) -> Position {
+        self.size()
+    }
+
+    fn base_visible(&self) -> Position {
+        self.size()
+    }
+
+    fn collect_chain_overwrites(&self, _into: &mut BTreeMap<Position, D>) {}
 }
 
 impl<E: RStorage + Clock + Metrics, D: Digest> DirtyMmr<E, D> {
@@ -1209,7 +1237,7 @@ mod tests {
             }
 
             let journaled_mmr = journaled_mmr.merkleize(&mut hasher);
-            assert_eq!(journaled_mmr.root(), *expected_root);
+            assert_eq!(journaled_mmr.root(), expected_root);
 
             journaled_mmr.destroy().await.unwrap();
         });
@@ -1326,11 +1354,7 @@ mod tests {
                     reference_mmr.add(&mut hasher, &element);
                 }
                 let reference_mmr = reference_mmr.merkleize(&mut hasher, None);
-                assert_eq!(
-                    root,
-                    *reference_mmr.root(),
-                    "root mismatch after pop at {i}"
-                );
+                assert_eq!(root, reference_mmr.root(), "root mismatch after pop at {i}");
                 mmr = clean_mmr.into_dirty();
             }
             assert!(matches!(mmr.pop(1).await, Err(Error::Empty)));
@@ -1357,7 +1381,7 @@ mod tests {
                 let reference_mmr = build_test_mmr(&mut hasher, reference_mmr, i);
                 assert_eq!(
                     root,
-                    *reference_mmr.root(),
+                    reference_mmr.root(),
                     "root mismatch at position {i:?}"
                 );
                 mmr = clean_mmr.into_dirty();
