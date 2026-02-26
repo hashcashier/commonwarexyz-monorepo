@@ -2881,11 +2881,10 @@ mod tests {
             // Even after nullification, late certification should still be forwarded to resolver.
             let reported = loop {
                 select! {
-                    msg = resolver_receiver.recv() => {
-                        match msg.unwrap() {
-                            MailboxMessage::Certified { view, success } if view == view5 => break Some(success),
-                            MailboxMessage::Certified { .. } | MailboxMessage::Certificate(_) => {}
-                        }
+                    msg = resolver_receiver.recv() => match msg.unwrap() {
+                        MailboxMessage::Certified { view, success } if view == view5 =>
+                            break Some(success),
+                        MailboxMessage::Certified { .. } | MailboxMessage::Certificate(_) => {}
                     },
                     msg = batcher_receiver.recv() => {
                         if let batcher::Message::Update { active, .. } = msg.unwrap() {
@@ -2990,18 +2989,16 @@ mod tests {
 
             let emitted_nullify = loop {
                 select! {
-                    msg = batcher_receiver.recv() => {
-                        match msg.unwrap() {
-                            batcher::Message::Constructed(Vote::Nullify(nullify))
-                                if nullify.view() == target_view =>
-                            {
-                                break true;
-                            }
-                            batcher::Message::Update { active, .. } => {
-                                active.send(true).unwrap();
-                            }
-                            _ => {}
+                    msg = batcher_receiver.recv() => match msg.unwrap() {
+                        batcher::Message::Constructed(Vote::Nullify(nullify))
+                            if nullify.view() == target_view =>
+                        {
+                            break true;
                         }
+                        batcher::Message::Update { active, .. } => {
+                            active.send(true).unwrap();
+                        }
+                        _ => {}
                     },
                     _ = context.sleep(Duration::from_secs(2)) => break false,
                 }
@@ -3097,13 +3094,11 @@ mod tests {
 
             let certified = loop {
                 select! {
-                    msg = resolver_receiver.recv() => {
-                        match msg.unwrap() {
-                            MailboxMessage::Certified { view, success } if view == target_view => {
-                                break Some(success);
-                            }
-                            MailboxMessage::Certified { .. } | MailboxMessage::Certificate(_) => {}
+                    msg = resolver_receiver.recv() => match msg.unwrap() {
+                        MailboxMessage::Certified { view, success } if view == target_view => {
+                            break Some(success);
                         }
+                        MailboxMessage::Certified { .. } | MailboxMessage::Certificate(_) => {}
                     },
                     msg = batcher_receiver.recv() => {
                         if let batcher::Message::Update { active, .. } = msg.unwrap() {
